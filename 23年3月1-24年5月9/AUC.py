@@ -450,9 +450,9 @@ def qc_cgm_for_meal(df_cgm, meal_datetime, venous_glu=None):
             status = "校准失败"
             detail["reason"] = "存在CGM值超出静脉血±3范围"
 
-    # ========= 6. 数据完整性：6:30-10:30 是否有缺失>30min =========
+    # ========= 6. 数据完整性：6:30-12:00 是否有缺失>30min =========
     win_start = meal_datetime - timedelta(minutes=30)   # 6:30
-    win_end   = meal_datetime + timedelta(minutes=210)  # 10:30
+    win_end   = meal_datetime + timedelta(minutes=300)  # 12:00
 
     mask_win = (df_cgm["测量时间"] >= win_start) & (df_cgm["测量时间"] <= win_end)
     df_win = df_cgm[mask_win].copy().sort_values("测量时间")
@@ -461,7 +461,7 @@ def qc_cgm_for_meal(df_cgm, meal_datetime, venous_glu=None):
         # 馒头餐附近完全没有CGM
         if status == "正常":
             status = "数据缺失"
-        detail["reason"] = detail.get("reason", "") + "；6:30-10:30 无CGM记录"
+        detail["reason"] = detail.get("reason", "") + "；6:30-12:00 无CGM记录"
         return status, detail
 
     # 计算相邻点间隔
@@ -478,9 +478,9 @@ def qc_cgm_for_meal(df_cgm, meal_datetime, venous_glu=None):
             # 比如已经是"校准失败"，那就两种问题都有
             status = status + "+数据不够"
         if "reason" in detail:
-            detail["reason"] += f"；6:30-10:30 内存在间隔>{max_gap:.1f}min"
+            detail["reason"] += f"；6:30-12:00 内存在间隔>{max_gap:.1f}min"
         else:
-            detail["reason"] = f"6:30-10:30 内存在间隔>{max_gap:.1f}min"
+            detail["reason"] = f"6:30-12:00 内存在间隔>{max_gap:.1f}min"
 
     return status, detail
 
@@ -498,12 +498,25 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     # 想跑第21到第40个文件：索引从20到39
-    start = 20
-    end = 39
+    start = 0
+    end = 2465
     cgm_files_to_process = all_cgm_files[start:end]
     print(f"将在目录 {CGM_DIR} 中处理第 {start+1} 到第 {end} 个文件。")
 
-    all_rows = []
+
+    # 预先定义结果列顺序
+    base_cols = [
+        "case_id", "qc_status", "qc_reason",
+        "meal_date", "meal_datetime", "venous_glu",
+        "G0", "G15", "G30", "G45", "G60", "G75", "G90", "G105",
+        "G120", "G135", "G150", "G165", "G180",
+        "G_peak", "T_baseline2peak_min", "S_baseline_peak", "S_peak_end",
+        "AUC_0_180", "pAUC", "nAUC", "iAUC",
+    ]
+    cgm_cols = []
+    for i in range(23):
+        cgm_cols.append(f"CGM{i + 1}_time")
+        cgm_cols.append(f"CGM{i + 1}_value")
 
     for cgm_path in cgm_files_to_process:
         base_name = os.path.basename(cgm_path)
@@ -545,32 +558,26 @@ if __name__ == "__main__":
                     else:
                         row[col_t] = np.nan
                         row[col_g] = np.nan
-                all_rows.append(row)
 
-    if not all_rows:
-        print("没有任何馒头餐事件成功完成计算，未生成结果表。")
-        raise SystemExit(0)
+                # 将当前这一条结果转为 DataFrame，并按预定列顺序排列
+                row_df = pd.DataFrame([row])
+                ordered_cols = [c for c in base_cols if c in row_df.columns] + [c for c in cgm_cols if c in row_df.columns]
+                row_df = row_df[ordered_cols]
 
-    # ③ 汇总成一个 DataFrame，指定列顺序
-    results_df = pd.DataFrame(all_rows)
-    base_cols = [
-        "case_id", "qc_status", "qc_reason",
-        "meal_date", "meal_datetime", "venous_glu",
-        "G0", "G15", "G30", "G45", "G60", "G75", "G90", "G105",
-        "G120", "G135", "G150", "G165", "G180",
-        "G_peak", "T_baseline2peak_min", "S_baseline_peak", "S_peak_end",
-        "AUC_0_180", "pAUC", "nAUC", "iAUC",
-    ]
-    cgm_cols = []
-    for i in range(23):
-        cgm_cols.append(f"CGM{i + 1}_time")
-        cgm_cols.append(f"CGM{i + 1}_value")
-    ordered_cols = [c for c in base_cols if c in results_df.columns] + [c for c in cgm_cols if c in results_df.columns]
-    results_df = results_df[ordered_cols]
+                # 逐条写入/追加到 Excel 文件
+                out_path = "cgm_data.xlsx"
+                if os.path.exists(out_path):
+                    try:
+                        existing_df = pd.read_excel(out_path)
+                    except Exception:
+                        existing_df = pd.DataFrame()
+                    # 对齐列：取并集，并按已有顺序+新列顺序排列
+                    all_cols = list(dict.fromkeys(existing_df.columns.tolist() + ordered_cols))
+                    existing_df = existing_df.reindex(columns=all_cols)
+                    row_df = row_df.reindex(columns=all_cols)
+                    combined = pd.concat([existing_df, row_df], ignore_index=True)
+                    combined.to_excel(out_path, index=False)
+                else:
+                    row_df.to_excel(out_path, index=False)
 
-    # ④ 打印结果并写入Excel
-    print("\n计算结果预览：")
-    print(results_df.to_string(index=False))
-
-    results_df.to_excel("cgm_data.xlsx", index=False)
-    print("\n已将结果写入 ./cgm_data.xlsx")
+    print("\n全部处理完成，结果已逐条追加写入 ./cgm_data.xlsx")
