@@ -22,6 +22,9 @@ CGM_DIR = r"（2）处理之后的数据/2465人动态血糖/"
 # 要读取的文件个数
 N_FILES = 20
 
+# 临床特征总表（包含静脉血葡萄糖等特征）
+FEATURES_EXCEL_PATH = r"（2）处理之后的数据/2465人的临床特征.xlsx"
+
 
 ###############################
 # 2. 找出该病案号的馒头餐事件日期
@@ -39,10 +42,11 @@ def find_mantou_meals(original_excel_path, case_id):
        - C 列：时间（含日期）
        - F、AC、AG 三列同时非空 → 一次馒头餐
 
-    返回：该病案号所有馒头餐“就餐时间”（当日早 7:00）及对应静脉血葡萄糖值的列表
+    返回：该病案号所有馒头餐“就餐时间”（当日早 7:00）及对应静脉血葡萄糖值的列表。
+    静脉血葡萄糖值 venous_glu 从 FEATURES_EXCEL_PATH 中按病案号获取（C 列病案号，AV 列静脉血葡萄糖）。
     """
 
-    meal_dict = {}
+    meal_dates = set()
 
     # ========= 1. 先查 230301-240509.xlsx 里的“检验” =========
     df = pd.read_excel(original_excel_path, sheet_name="检验")
@@ -60,11 +64,9 @@ def find_mantou_meals(original_excel_path, case_id):
 
     if not sub.empty:
         report_times = pd.to_datetime(sub.iloc[:, 6])
-        glu_values = sub.iloc[:, 18]
-        for rt, glu in zip(report_times, glu_values):
+        for rt in report_times:
             meal_dt = datetime.combine(rt.date(), time(hour=7, minute=0))  # 当日 7:00
-            if meal_dt not in meal_dict:
-                meal_dict[meal_dt] = float(glu)
+            meal_dates.add(meal_dt)
 
     # ========= 2. 再查 1_动态血糖监测其他数据.xlsx =========
     try:
@@ -91,20 +93,41 @@ def find_mantou_meals(original_excel_path, case_id):
 
         if not sub2.empty:
             report_times2 = pd.to_datetime(sub2.iloc[:, 2])
-            glu_values2 = sub2.iloc[:, 5]
-            for rt, glu2 in zip(report_times2, glu_values2):
+            for rt in report_times2:
                 meal_dt = datetime.combine(rt.date(), time(hour=7, minute=0))
-                if meal_dt not in meal_dict:
-                    meal_dict[meal_dt] = float(glu2)
+                meal_dates.add(meal_dt)
 
     # ========= 3. 去重 & 排序 =========
-    if not meal_dict:
+    if not meal_dates:
         print(f"没有在两个文件中找到病案号 {case_id} 的馒头餐记录")
         return []
 
+    # 从临床特征总表中读取该病案号的静脉血葡萄糖（AV 列）
+    try:
+        feat_df = pd.read_excel(FEATURES_EXCEL_PATH, sheet_name=0)
+    except FileNotFoundError:
+        print(f"未找到临床特征文件：{FEATURES_EXCEL_PATH}")
+        venous_glu = None
+    else:
+        # C 列为病案号 → iloc[:,2]
+        # AV 列为静脉血葡萄糖：
+        # A=0, B=1, C=2, ..., Z=25, AA=26, AB=27, AC=28, AD=29, AE=30, AF=31, AG=32,
+        # AH=33, AI=34, AJ=35, AK=36, AL=37, AM=38, AN=39, AO=40, AP=41, AQ=42, AR=43,
+        # AS=44, AT=45, AU=46, AV=47
+        case_col = feat_df.iloc[:, 2]
+        glu_col = feat_df.iloc[:, 47]
+        mask_feat = (case_col == case_id)
+        sub_feat = feat_df[mask_feat]
+        if sub_feat.empty:
+            print(f"在临床特征表中未找到病案号 {case_id} 的静脉血葡萄糖（AV 列），venous_glu 设为 None。")
+            venous_glu = None
+        else:
+            # 如有多行，取第一行
+            venous_glu = float(sub_feat.iloc[0, 47])
+
     meal_infos = []
-    for dt in sorted(meal_dict.keys()):
-        meal_infos.append({"meal_datetime": dt, "venous_glu": meal_dict[dt]})
+    for dt in sorted(meal_dates):
+        meal_infos.append({"meal_datetime": dt, "venous_glu": venous_glu})
 
     return meal_infos
 
@@ -475,8 +498,8 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     # 想跑第21到第40个文件：索引从20到39
-    start = 0
-    end = 20
+    start = 20
+    end = 39
     cgm_files_to_process = all_cgm_files[start:end]
     print(f"将在目录 {CGM_DIR} 中处理第 {start+1} 到第 {end} 个文件。")
 
