@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, time, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ###############################
 # 1. 基础配置（路径 & 病案号）
@@ -16,6 +17,7 @@ RAW_CGM_DIR = r"（1）原数据/1_动态血糖"
 # 动态血糖监测其他数据（额外的馒头餐来源）
 OTHER_EXCEL_PATH = r"（1）原数据/1_动态血糖监测其他数据.xlsx"
 
+
 # CGM 文件夹路径（处理后的 2465 人动态血糖）
 CGM_DIR = r"（2）处理之后的数据/2465人动态血糖/"
 
@@ -24,6 +26,25 @@ N_FILES = 20
 
 # 临床特征总表（包含静脉血葡萄糖等特征）
 FEATURES_EXCEL_PATH = r"（2）处理之后的数据/2465人的临床特征.xlsx"
+
+# 预先读取大表到内存（只读），避免在多线程中重复从磁盘加载
+try:
+    EXAM_DF = pd.read_excel(ORIGINAL_EXCEL_PATH, sheet_name="检验")
+except FileNotFoundError:
+    print(f"警告：未找到原始检验总表 {ORIGINAL_EXCEL_PATH}，EXAM_DF 设为 None。")
+    EXAM_DF = None
+
+try:
+    OTHER_DF = pd.read_excel(OTHER_EXCEL_PATH, sheet_name="检验")
+except FileNotFoundError:
+    print(f"警告：未找到动态血糖监测其他数据 {OTHER_EXCEL_PATH}，OTHER_DF 设为 None。")
+    OTHER_DF = None
+
+try:
+    FEATURES_DF = pd.read_excel(FEATURES_EXCEL_PATH, sheet_name=0)
+except FileNotFoundError:
+    print(f"警告：未找到临床特征文件 {FEATURES_EXCEL_PATH}，FEATURES_DF 设为 None。")
+    FEATURES_DF = None
 
 
 ###############################
@@ -49,7 +70,10 @@ def find_mantou_meals(original_excel_path, case_id):
     meal_dates = set()
 
     # ========= 1. 先查 230301-240509.xlsx 里的“检验” =========
-    df = pd.read_excel(original_excel_path, sheet_name="检验")
+    if EXAM_DF is None:
+        print(f"EXAM_DF 为空，无法在 {ORIGINAL_EXCEL_PATH} 中查找病案号 {case_id} 的馒头餐记录。")
+        return []
+    df = EXAM_DF
 
     # 注意：iloc 是 0 开始，所以 C=2, G=6, S=18, AB=27, AF=31
     col_case = df.iloc[:, 2]   # C 列：病案号
@@ -69,13 +93,10 @@ def find_mantou_meals(original_excel_path, case_id):
             meal_dates.add(meal_dt)
 
     # ========= 2. 再查 1_动态血糖监测其他数据.xlsx =========
-    try:
-        df2 = pd.read_excel(OTHER_EXCEL_PATH, sheet_name="检验")  # 默认第一个 sheet
-    except FileNotFoundError:
+    df2 = OTHER_DF
+    if df2 is None:
         print("未找到 1_动态血糖监测其他数据.xlsx，先只用检验表。")
-        df2 = None
-
-    if df2 is not None:
+    else:
         # B 列：病案号 → iloc[:,1]
         # C 列：时间   → iloc[:,2]
         # F 列：检测值 → iloc[:,5]
@@ -103,12 +124,11 @@ def find_mantou_meals(original_excel_path, case_id):
         return []
 
     # 从临床特征总表中读取该病案号的静脉血葡萄糖（AV 列）
-    try:
-        feat_df = pd.read_excel(FEATURES_EXCEL_PATH, sheet_name=0)
-    except FileNotFoundError:
-        print(f"未找到临床特征文件：{FEATURES_EXCEL_PATH}")
+    if FEATURES_DF is None:
+        print(f"FEATURES_DF 为空，无法在 {FEATURES_EXCEL_PATH} 中查找病案号 {case_id} 的静脉血葡萄糖。")
         venous_glu = None
     else:
+        feat_df = FEATURES_DF
         # C 列为病案号 → iloc[:,2]
         # AV 列为静脉血葡萄糖：
         # A=0, B=1, C=2, ..., Z=25, AA=26, AB=27, AC=28, AD=29, AE=30, AF=31, AG=32,
@@ -489,6 +509,63 @@ def qc_cgm_for_meal(df_cgm, meal_datetime, venous_glu=None):
 # 5. 主流程：遍历前 N 个处理后 CGM 文件
 ###############################
 
+
+# 处理单个 CGM 文件，返回结果行列表（不写文件）
+def process_cgm_file(cgm_path):
+    """
+    处理单个 CGM 文件（对应一个病案号），返回该病案号所有馒头餐事件的结果行列表。
+    不在此函数内进行任何文件写入，仅返回结果字典列表。
+    """
+    rows = []
+
+    base_name = os.path.basename(cgm_path)
+    name_no_ext = os.path.splitext(base_name)[0]
+    # 文件命名可能为 '123456.xlsx' 或 '123456-姓名.xlsx'，只取 '-' 前面的部分作为病案号
+    case_str = name_no_ext.split("-")[0]
+    try:
+        case_id = int(case_str)
+    except ValueError:
+        case_id = case_str  # 如果不能转成整数，就按字符串匹配
+
+    print(f"\n=== 处理文件: {base_name} (case_id={case_id}) ===")
+
+    # 找出该病案号的所有馒头餐就餐时间（当日 7:00）及对应静脉血葡萄糖值
+    meal_infos = find_mantou_meals(ORIGINAL_EXCEL_PATH, case_id)
+
+    if not meal_infos:
+        print(f"病案号 {case_id} 未检测到任何馒头餐记录，跳过该文件。")
+        return rows
+
+    print("检测到的馒头餐就餐时间：")
+    for info in meal_infos:
+        print(f" - {info['meal_datetime']} (Glu={info['venous_glu']})")
+
+    # 对每一次馒头餐跑一遍 CGM 指标计算，展开原始CGM窗口的前23个点到同一行
+    for info in meal_infos:
+        mt = info["meal_datetime"]
+        venous_glu = info["venous_glu"]
+        res, raw = process_one_meal(cgm_path, case_id, mt, venous_glu=venous_glu)
+        if res is not None and raw is not None:
+            row = res.copy()
+            # 将原始CGM窗口的前 23 个点展开到同一行
+            for i in range(23):
+                col_t = f"CGM{i + 1}_time"
+                col_g = f"CGM{i + 1}_value"
+                if i < len(raw):
+                    row[col_t] = raw.iloc[i]["测量时间"]
+                    row[col_g] = raw.iloc[i]["测量值"]
+                else:
+                    row[col_t] = np.nan
+                    row[col_g] = np.nan
+            rows.append(row)
+
+    return rows
+
+
+###############################
+# 5. 主流程：遍历前 N 个处理后 CGM 文件
+###############################
+
 if __name__ == "__main__":
     # 列出处理后 CGM 目录中的前 N_FILES 个 .xlsx 文件
     pattern = os.path.join(CGM_DIR, "*.xlsx")
@@ -502,7 +579,6 @@ if __name__ == "__main__":
     end = 2465
     cgm_files_to_process = all_cgm_files[start:end]
     print(f"将在目录 {CGM_DIR} 中处理第 {start+1} 到第 {end} 个文件。")
-
 
     # 预先定义结果列顺序
     base_cols = [
@@ -518,66 +594,46 @@ if __name__ == "__main__":
         cgm_cols.append(f"CGM{i + 1}_time")
         cgm_cols.append(f"CGM{i + 1}_value")
 
-    for cgm_path in cgm_files_to_process:
-        base_name = os.path.basename(cgm_path)
-        name_no_ext = os.path.splitext(base_name)[0]
-        # 文件命名可能为 '123456.xlsx' 或 '123456-姓名.xlsx'，只取 '-' 前面的部分作为病案号
-        case_str = name_no_ext.split("-")[0]
-        try:
-            case_id = int(case_str)
-        except ValueError:
-            case_id = case_str  # 如果不能转成整数，就按字符串匹配
+    all_rows = []
 
-        print(f"\n=== 处理文件: {base_name} (case_id={case_id}) ===")
+    # 使用多线程并行处理每个 CGM 文件
+    max_workers = min(10, len(cgm_files_to_process)) if cgm_files_to_process else 0
+    if max_workers == 0:
+        print("没有需要处理的 CGM 文件。")
+        raise SystemExit(0)
 
-        # ① 找出该病案号的所有馒头餐就餐时间（当日 7:00）及对应静脉血葡萄糖值
-        meal_infos = find_mantou_meals(ORIGINAL_EXCEL_PATH, case_id)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {executor.submit(process_cgm_file, cgm_path): cgm_path for cgm_path in cgm_files_to_process}
+        for future in as_completed(future_to_path):
+            cgm_path = future_to_path[future]
+            try:
+                rows = future.result()
+            except Exception as e:
+                print(f"处理文件 {os.path.basename(cgm_path)} 时出错: {e}")
+                continue
+            if rows:
+                all_rows.extend(rows)
 
-        if not meal_infos:
-            print(f"病案号 {case_id} 未检测到任何馒头餐记录，跳过该文件。")
-            continue
+    if not all_rows:
+        print("没有任何馒头餐事件成功完成计算，未生成结果表。")
+        raise SystemExit(0)
 
-        print("检测到的馒头餐就餐时间：")
-        for info in meal_infos:
-            print(f" - {info['meal_datetime']} (Glu={info['venous_glu']})")
+    # 汇总成一个 DataFrame，指定列顺序
+    results_df = pd.DataFrame(all_rows)
+    ordered_cols = [c for c in base_cols if c in results_df.columns]
+    for i in range(23):
+        col_t = f"CGM{i + 1}_time"
+        col_g = f"CGM{i + 1}_value"
+        if col_t in results_df.columns:
+            ordered_cols.append(col_t)
+        if col_g in results_df.columns:
+            ordered_cols.append(col_g)
+    results_df = results_df[ordered_cols]
 
-        # ② 对每一次馒头餐跑一遍 CGM 指标计算，展开原始CGM窗口的前23个点到同一行
-        for info in meal_infos:
-            mt = info["meal_datetime"]
-            venous_glu = info["venous_glu"]
-            res, raw = process_one_meal(cgm_path, case_id, mt, venous_glu=venous_glu)
-            if res is not None and raw is not None:
-                row = res.copy()
-                # 将原始CGM窗口的前 23 个点展开到同一行
-                for i in range(23):
-                    col_t = f"CGM{i + 1}_time"
-                    col_g = f"CGM{i + 1}_value"
-                    if i < len(raw):
-                        row[col_t] = raw.iloc[i]["测量时间"]
-                        row[col_g] = raw.iloc[i]["测量值"]
-                    else:
-                        row[col_t] = np.nan
-                        row[col_g] = np.nan
+    # 打印结果并写入Excel
+    print("\n计算结果预览：")
+    print(results_df.to_string(index=False))
 
-                # 将当前这一条结果转为 DataFrame，并按预定列顺序排列
-                row_df = pd.DataFrame([row])
-                ordered_cols = [c for c in base_cols if c in row_df.columns] + [c for c in cgm_cols if c in row_df.columns]
-                row_df = row_df[ordered_cols]
-
-                # 逐条写入/追加到 Excel 文件
-                out_path = "cgm_data.xlsx"
-                if os.path.exists(out_path):
-                    try:
-                        existing_df = pd.read_excel(out_path)
-                    except Exception:
-                        existing_df = pd.DataFrame()
-                    # 对齐列：取并集，并按已有顺序+新列顺序排列
-                    all_cols = list(dict.fromkeys(existing_df.columns.tolist() + ordered_cols))
-                    existing_df = existing_df.reindex(columns=all_cols)
-                    row_df = row_df.reindex(columns=all_cols)
-                    combined = pd.concat([existing_df, row_df], ignore_index=True)
-                    combined.to_excel(out_path, index=False)
-                else:
-                    row_df.to_excel(out_path, index=False)
-
-    print("\n全部处理完成，结果已逐条追加写入 ./cgm_data.xlsx")
+    out_path = "cgm_data.xlsx"
+    results_df.to_excel(out_path, index=False)
+    print(f"\n全部处理完成，结果已写入 ./{out_path}")
